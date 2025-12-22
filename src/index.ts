@@ -11,6 +11,17 @@ import chalk from 'chalk';
 import { promises as fs } from 'fs';
 import path from 'path';
 
+// ===== CONSTANTS =====
+
+const STOP_WORDS = new Set([
+  'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'he',
+  'in', 'is', 'it', 'its', 'of', 'on', 'or', 'that', 'the', 'to', 'was', 'were',
+  'will', 'with', 'the', 'this', 'but', 'they', 'have', 'had', 'what', 'when',
+  'where', 'who', 'which', 'why', 'how', 'all', 'any', 'both', 'each', 'few',
+  'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own',
+  'same', 'so', 'than', 'too', 'very', 'can', 'just', 'should', 'now'
+]);
+
 // ===== TYPES =====
 
 interface MemoryNode {
@@ -40,25 +51,25 @@ interface AdvancedThoughtData {
   thoughtNumber: number;
   totalThoughts: number;
   nextThoughtNeeded: boolean;
-  
+
   // Advanced cognitive fields
   confidence: number;
   reasoning_quality: 'low' | 'medium' | 'high';
   meta_thought: string;
   goal?: string;
   progress?: number;
-  
+
   // Hypothesis testing
   hypothesis?: string;
   test_plan?: string;
   test_result?: string;
   evidence?: string[];
-  
+
   // Memory and context
   session_id?: string;
   builds_on?: string[];
   challenges?: string[];
-  
+
   // Branching (inherited from sequential thinking)
   isRevision?: boolean;
   revisesThought?: number;
@@ -147,7 +158,7 @@ class SystemJSON {
         JSON.parse(jsonContent);
         await fs.rename(tempPath, filePath);
       } catch (parseError) {
-        await fs.unlink(tempPath).catch(() => {});
+        await fs.unlink(tempPath).catch(() => { });
         throw new Error(`JSON validation failed: ${parseError}`);
       }
 
@@ -258,6 +269,10 @@ class CognitiveMemory {
   private memoryDataPath: string;
   private currentLibraryName: string = 'cognitive_memory'; // Default library name
 
+  // TF-IDF State
+  private documentFrequencies: Map<string, number> = new Map();
+  private totalDocuments: number = 0;
+
   constructor() {
     // Store memory data relative to the project directory, not cwd
     const projectDir = path.dirname(new URL(import.meta.url).pathname);
@@ -274,6 +289,29 @@ class CognitiveMemory {
     }
   }
 
+  private updateTfIdfStats(content: string): void {
+    this.totalDocuments++;
+    const words = new Set(
+      content.toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .split(/\s+/)
+        .filter(w => w.length > 2 && !STOP_WORDS.has(w))
+    );
+
+    for (const word of words) {
+      this.documentFrequencies.set(word, (this.documentFrequencies.get(word) || 0) + 1);
+    }
+  }
+
+  private rebuildSearchIndex(): void {
+    this.documentFrequencies.clear();
+    this.totalDocuments = 0;
+
+    for (const node of this.nodes.values()) {
+      this.updateTfIdfStats(node.content);
+    }
+  }
+
   private async saveToFile(): Promise<void> {
     try {
       const memoryState = {
@@ -282,21 +320,21 @@ class CognitiveMemory {
         timestamp: Date.now(),
         libraryName: this.currentLibraryName
       };
-      
+
       const fileName = `${this.currentLibraryName}.json`;
       const filePath = path.join(this.memoryDataPath, fileName);
       const tempPath = path.join(this.memoryDataPath, `${fileName}.tmp`);
-      
+
       // Atomic write: write to temp file first, then rename
       const jsonContent = JSON.stringify(memoryState, null, 2);
       await fs.writeFile(tempPath, jsonContent, 'utf-8');
-      
+
       // Validate JSON before committing
       try {
         JSON.parse(jsonContent);
         await fs.rename(tempPath, filePath);
       } catch (parseError) {
-        await fs.unlink(tempPath).catch(() => {}); // Clean up temp file
+        await fs.unlink(tempPath).catch(() => { }); // Clean up temp file
         throw new Error(`JSON validation failed: ${parseError}`);
       }
     } catch (error) {
@@ -309,9 +347,9 @@ class CognitiveMemory {
       const targetLibrary = libraryName || this.currentLibraryName;
       const fileName = `${targetLibrary}.json`;
       const filePath = path.join(this.memoryDataPath, fileName);
-      
+
       const data = await fs.readFile(filePath, 'utf-8');
-      
+
       // Validate JSON before parsing
       let memoryState;
       try {
@@ -319,32 +357,38 @@ class CognitiveMemory {
       } catch (parseError) {
         throw new Error(`Invalid JSON in library ${targetLibrary}: ${parseError}`);
       }
-      
+
       this.nodes = new Map(memoryState.nodes);
       this.sessions = new Map(memoryState.sessions);
       this.currentLibraryName = targetLibrary;
-      
+
+      // Rebuild search index from loaded nodes
+      this.rebuildSearchIndex();
+
       console.error(`Loaded ${this.nodes.size} memory nodes and ${this.sessions.size} sessions from library: ${targetLibrary}`);
     } catch (error) {
       // File doesn't exist or is corrupted - start with empty memory
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.error('Failed to load memory from file:', error);
       }
+      // Ensure index is reset if load fails
+      this.documentFrequencies.clear();
+      this.totalDocuments = 0;
     }
   }
 
   // === LIBRARY MANAGEMENT METHODS ===
-  
+
   async createLibrary(libraryName: string): Promise<{ success: boolean; message: string }> {
     try {
       // Validate library name (alphanumeric, underscore, hyphen only)
       if (!/^[a-zA-Z0-9_-]+$/.test(libraryName)) {
         return { success: false, message: 'Library name must contain only letters, numbers, underscores, and hyphens' };
       }
-      
+
       const fileName = `${libraryName}.json`;
       const filePath = path.join(this.memoryDataPath, fileName);
-      
+
       // Check if library already exists
       try {
         await fs.access(filePath);
@@ -352,43 +396,44 @@ class CognitiveMemory {
       } catch {
         // Library doesn't exist, which is what we want
       }
-      
+
       // Save current state if we have data
       if (this.nodes.size > 0 || this.sessions.size > 0) {
         await this.saveToFile();
       }
-      
+
       // Clear current memory and create new library
       this.nodes.clear();
       this.sessions.clear();
+      this.rebuildSearchIndex();
       this.currentLibraryName = libraryName;
-      
+
       // Save empty library
       await this.saveToFile();
-      
+
       return { success: true, message: `Created library: ${libraryName}` };
     } catch (error) {
       return { success: false, message: `Failed to create library: ${error}` };
     }
   }
-  
+
   async listLibraries(): Promise<{ libraries: Array<{ name: string; size: number; lastModified: Date }> }> {
     try {
       const files = await fs.readdir(this.memoryDataPath);
       const libraries = [];
-      
+
       for (const file of files) {
         if (file.endsWith('.json') && !file.endsWith('.tmp')) {
           const filePath = path.join(this.memoryDataPath, file);
           const stats = await fs.stat(filePath);
           const libraryName = file.replace('.json', '');
-          
+
           // Get library size (node count) by reading the file
           try {
             const data = await fs.readFile(filePath, 'utf-8');
             const memoryState = JSON.parse(data);
             const nodeCount = memoryState.nodes ? memoryState.nodes.length : 0;
-            
+
             libraries.push({
               name: libraryName,
               size: nodeCount,
@@ -400,40 +445,40 @@ class CognitiveMemory {
           }
         }
       }
-      
+
       return { libraries: libraries.sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime()) };
     } catch (error) {
       console.error('Failed to list libraries:', error);
       return { libraries: [] };
     }
   }
-  
+
   async switchLibrary(libraryName: string): Promise<{ success: boolean; message: string }> {
     try {
       const fileName = `${libraryName}.json`;
       const filePath = path.join(this.memoryDataPath, fileName);
-      
+
       // Check if library exists
       try {
         await fs.access(filePath);
       } catch {
         return { success: false, message: `Library "${libraryName}" does not exist` };
       }
-      
+
       // Save current state if we have unsaved changes
       if (this.nodes.size > 0 || this.sessions.size > 0) {
         await this.saveToFile();
       }
-      
+
       // Load the new library
       await this.loadFromFile(libraryName);
-      
+
       return { success: true, message: `Switched to library: ${libraryName}` };
     } catch (error) {
       return { success: false, message: `Failed to switch library: ${error}` };
     }
   }
-  
+
   getCurrentLibraryName(): string {
     return this.currentLibraryName;
   }
@@ -450,19 +495,22 @@ class CognitiveMemory {
       confidence: metadata.confidence as number || 0.5
     };
     this.nodes.set(id, node);
-    
+
+    // Update TF-IDF index
+    this.updateTfIdfStats(content);
+
     // Auto-save to persistence
-    this.saveToFile().catch(error => 
+    this.saveToFile().catch(error =>
       console.error('Failed to auto-save memory node:', error)
     );
-    
+
     return id;
   }
 
   connectNodes(nodeId1: string, nodeId2: string): void {
     const node1 = this.nodes.get(nodeId1);
     const node2 = this.nodes.get(nodeId2);
-    
+
     if (node1 && node2) {
       if (!node1.connections.includes(nodeId2)) {
         node1.connections.push(nodeId2);
@@ -470,19 +518,24 @@ class CognitiveMemory {
       if (!node2.connections.includes(nodeId1)) {
         node2.connections.push(nodeId1);
       }
+
+      // Auto-save connection changes
+      this.saveToFile().catch(error =>
+        console.error('Failed to auto-save connections:', error)
+      );
     }
   }
 
   queryRelated(content: string, maxResults: number = 5): MemoryNode[] {
     const results: Array<{ node: MemoryNode; relevance: number }> = [];
-    
+
     for (const node of this.nodes.values()) {
       const relevance = this.calculateRelevance(content, node.content);
-      if (relevance > 0.1) {
+      if (relevance > 0.1) { // Threshold
         results.push({ node, relevance });
       }
     }
-    
+
     return results
       .sort((a, b) => b.relevance - a.relevance)
       .slice(0, maxResults)
@@ -490,10 +543,36 @@ class CognitiveMemory {
   }
 
   private calculateRelevance(query: string, content: string): number {
-    const queryWords = query.toLowerCase().split(/\s+/);
-    const contentWords = content.toLowerCase().split(/\s+/);
-    const commonWords = queryWords.filter(word => contentWords.includes(word));
-    return commonWords.length / Math.max(queryWords.length, contentWords.length);
+    // TF-IDF Implementation
+    const queryTerms = query.toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+
+    if (queryTerms.length === 0) return 0;
+
+    const contentTerms = content.toLowerCase()
+      .replace(/[^\w\s]/g, '')
+      .split(/\s+/);
+
+    let score = 0;
+
+    for (const term of queryTerms) {
+      // Term Frequency (TF) in content
+      const termCount = contentTerms.filter(w => w === term).length;
+      if (termCount === 0) continue;
+
+      const tf = termCount / contentTerms.length;
+
+      // Inverse Document Frequency (IDF)
+      // log(total_docs / (docs_with_term + 1))
+      const docFreq = this.documentFrequencies.get(term) || 0;
+      const idf = Math.log(this.totalDocuments / (docFreq + 1)) + 1; // +1 smoothing
+
+      score += tf * idf;
+    }
+
+    return score;
   }
 
   async createSession(goal: string, libraryName?: string): Promise<string> {
@@ -505,7 +584,7 @@ class CognitiveMemory {
         // Continue with current library rather than failing
       }
     }
-    
+
     const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const context: ReasoningContext = {
       sessionId,
@@ -518,10 +597,10 @@ class CognitiveMemory {
       working_memory: []
     };
     this.sessions.set(sessionId, context);
-    
+
     // Auto-save to persistence
     await this.saveToFile();
-    
+
     return sessionId;
   }
 
@@ -529,9 +608,9 @@ class CognitiveMemory {
     const session = this.sessions.get(sessionId);
     if (session) {
       Object.assign(session, updates);
-      
+
       // Auto-save to persistence
-      this.saveToFile().catch(error => 
+      this.saveToFile().catch(error =>
         console.error('Failed to auto-save session update:', error)
       );
     }
@@ -541,7 +620,7 @@ class CognitiveMemory {
     return this.sessions.get(sessionId);
   }
 
-  getMemoryStats(): { nodes: number; sessions: number; connections: number } {
+  getMemoryStats(): { nodes: number; sessions: number; connections: number; totalDocuments: number } {
     let connections = 0;
     for (const node of this.nodes.values()) {
       connections += node.connections.length;
@@ -549,7 +628,8 @@ class CognitiveMemory {
     return {
       nodes: this.nodes.size,
       sessions: this.sessions.size,
-      connections: connections / 2 // Each connection is counted twice
+      connections: connections / 2, // Each connection is counted twice
+      totalDocuments: this.totalDocuments
     };
   }
 }
@@ -586,7 +666,7 @@ class AdvancedReasoningServer {
 
     // Validate advanced fields with defaults
     const confidence = typeof data.confidence === 'number' ? data.confidence : 0.5;
-    const reasoning_quality = ['low', 'medium', 'high'].includes(data.reasoning_quality as string) 
+    const reasoning_quality = ['low', 'medium', 'high'].includes(data.reasoning_quality as string)
       ? data.reasoning_quality as 'low' | 'medium' | 'high'
       : 'medium';
 
@@ -616,18 +696,18 @@ class AdvancedReasoningServer {
   }
 
   private formatAdvancedThought(thoughtData: AdvancedThoughtData): string {
-    const { 
-      thoughtNumber, 
-      totalThoughts, 
-      thought, 
-      confidence, 
-      reasoning_quality, 
+    const {
+      thoughtNumber,
+      totalThoughts,
+      thought,
+      confidence,
+      reasoning_quality,
       meta_thought,
       hypothesis,
-      isRevision, 
-      revisesThought, 
-      branchFromThought, 
-      branchId 
+      isRevision,
+      revisesThought,
+      branchFromThought,
+      branchId
     } = thoughtData;
 
     let prefix = '';
@@ -645,15 +725,15 @@ class AdvancedReasoningServer {
     }
 
     // Quality and confidence indicators
-    const qualityColor = reasoning_quality === 'high' ? chalk.green : 
-                        reasoning_quality === 'medium' ? chalk.yellow : chalk.red;
+    const qualityColor = reasoning_quality === 'high' ? chalk.green :
+      reasoning_quality === 'medium' ? chalk.yellow : chalk.red;
     const confidenceBar = '█'.repeat(Math.round(confidence * 10));
     const confidenceDisplay = chalk.cyan(`[${confidenceBar.padEnd(10)}] ${Math.round(confidence * 100)}%`);
 
     const header = `${prefix} ${thoughtNumber}/${totalThoughts}${context}`;
     const quality = qualityColor(`Quality: ${reasoning_quality.toUpperCase()}`);
     const confDisplay = `Confidence: ${confidenceDisplay}`;
-    
+
     let content = `Main: ${thought}`;
     if (meta_thought) {
       content += `\nMeta: ${chalk.italic(meta_thought)}`;
@@ -685,8 +765,8 @@ class AdvancedReasoningServer {
       // Store in memory if session provided
       if (validatedInput.session_id) {
         const nodeId = this.memory.addNode(
-          validatedInput.thought, 
-          'thought', 
+          validatedInput.thought,
+          'thought',
           {
             confidence: validatedInput.confidence,
             reasoning_quality: validatedInput.reasoning_quality,
@@ -694,6 +774,14 @@ class AdvancedReasoningServer {
             hypothesis: validatedInput.hypothesis
           }
         );
+
+        // NEW: Create graph edges from builds_on references
+        // We interpret strings in builds_on as Node IDs
+        if (validatedInput.builds_on && validatedInput.builds_on.length > 0) {
+          validatedInput.builds_on.forEach(targetId => {
+            this.memory.connectNodes(nodeId, targetId);
+          });
+        }
 
         // Update session context
         this.memory.updateSession(validatedInput.session_id, {
@@ -721,7 +809,8 @@ class AdvancedReasoningServer {
         console.error(formattedThought);
       }
 
-      // Generate related memories if session provided
+      // Generate related memories if session provided (for output)
+      // NEW: Passive context injection - automatically suggest connections
       let relatedMemories: MemoryNode[] = [];
       if (validatedInput.session_id) {
         relatedMemories = this.memory.queryRelated(validatedInput.thought, 3);
@@ -741,7 +830,10 @@ class AdvancedReasoningServer {
             branches: Object.keys(this.branches),
             thoughtHistoryLength: this.thoughtHistory.length,
             memoryStats: this.memory.getMemoryStats(),
-            relatedMemories: relatedMemories.map(m => ({ content: m.content, confidence: m.confidence }))
+            // Enhanced output with passive suggestions
+            relatedMemories: relatedMemories.map(m => ({ content: m.content, confidence: m.confidence })),
+            suggested_connections: relatedMemories.map(m => m.id),
+            consistency_note: relatedMemories.length > 0 ? "Verify consistency with related thoughts above" : undefined
           }, null, 2)
         }]
       };
@@ -762,7 +854,7 @@ class AdvancedReasoningServer {
   public async createLibrary(libraryName: string): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.memory.createLibrary(libraryName);
-      
+
       return {
         content: [{
           type: "text",
@@ -792,7 +884,7 @@ class AdvancedReasoningServer {
   public async listLibraries(): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.memory.listLibraries();
-      
+
       return {
         content: [{
           type: "text",
@@ -820,7 +912,7 @@ class AdvancedReasoningServer {
   public async switchLibrary(libraryName: string): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.memory.switchLibrary(libraryName);
-      
+
       return {
         content: [{
           type: "text",
@@ -878,7 +970,7 @@ class AdvancedReasoningServer {
     try {
       const relatedNodes = this.memory.queryRelated(query, 10);
       const session = this.memory.getSession(sessionId);
-      
+
       return {
         content: [{
           type: "text",
@@ -918,7 +1010,7 @@ class AdvancedReasoningServer {
   ): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.systemJson.createSystemJSON(name, domain, description, data, tags);
-      
+
       return {
         content: [{
           type: "text",
@@ -951,7 +1043,7 @@ class AdvancedReasoningServer {
   public async getSystemJSON(name: string): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.systemJson.getSystemJSON(name);
-      
+
       return {
         content: [{
           type: "text",
@@ -981,7 +1073,7 @@ class AdvancedReasoningServer {
   public async searchSystemJSON(query: string): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.systemJson.searchSystemJSON(query);
-      
+
       return {
         content: [{
           type: "text",
@@ -1015,7 +1107,7 @@ class AdvancedReasoningServer {
   public async listSystemJSON(): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean }> {
     try {
       const result = await this.systemJson.listSystemJSON();
-      
+
       return {
         content: [{
           type: "text",
@@ -1048,7 +1140,7 @@ const ADVANCED_REASONING_TOOL: Tool = {
 
 Key Features:
 - Meta-cognitive assessment and confidence tracking
-- Hypothesis formulation and testing capabilities  
+- Hypothesis formulation and testing capabilities
 - Integrated graph-based memory system
 - Dynamic reasoning quality evaluation
 - Session-based context management
@@ -1086,25 +1178,25 @@ Use this tool for complex reasoning that benefits from:
       nextThoughtNeeded: { type: "boolean", description: "Whether another thought step is needed" },
       thoughtNumber: { type: "integer", description: "Current thought number", minimum: 1 },
       totalThoughts: { type: "integer", description: "Estimated total thoughts needed", minimum: 1 },
-      
+
       // Advanced cognitive fields
       confidence: { type: "number", description: "Confidence in this reasoning step (0.0-1.0)", minimum: 0, maximum: 1 },
       reasoning_quality: { type: "string", description: "Assessment of reasoning quality", enum: ["low", "medium", "high"] },
       meta_thought: { type: "string", description: "Meta-cognitive reflection on your reasoning process" },
       goal: { type: "string", description: "Overall goal or objective" },
       progress: { type: "number", description: "Progress toward goal (0.0-1.0)", minimum: 0, maximum: 1 },
-      
+
       // Hypothesis testing
       hypothesis: { type: "string", description: "Current working hypothesis" },
       test_plan: { type: "string", description: "Plan for testing the hypothesis" },
       test_result: { type: "string", description: "Result of hypothesis testing" },
       evidence: { type: "array", items: { type: "string" }, description: "Evidence for/against hypothesis" },
-      
+
       // Memory and context
       session_id: { type: "string", description: "Reasoning session identifier" },
       builds_on: { type: "array", items: { type: "string" }, description: "Previous thoughts this builds on" },
       challenges: { type: "array", items: { type: "string" }, description: "Ideas this challenges or contradicts" },
-      
+
       // Branching (inherited)
       isRevision: { type: "boolean", description: "Whether this revises previous thinking" },
       revisesThought: { type: "integer", description: "Which thought is being reconsidered", minimum: 1 },
@@ -1301,7 +1393,7 @@ const reasoningServer = new AdvancedReasoningServer();
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
-    ADVANCED_REASONING_TOOL, 
+    ADVANCED_REASONING_TOOL,
     QUERY_MEMORY_TOOL,
     CREATE_LIBRARY_TOOL,
     LIST_LIBRARIES_TOOL,
@@ -1316,50 +1408,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  
+
   switch (name) {
     case "advanced_reasoning":
       return reasoningServer.processAdvancedThought(args);
-    
+
     case "query_reasoning_memory":
       const { session_id, query } = args as { session_id: string; query: string };
       return reasoningServer.queryMemory(session_id, query);
-    
+
     case "create_memory_library":
       const { library_name: createLibName } = args as { library_name: string };
       return await reasoningServer.createLibrary(createLibName);
-    
+
     case "list_memory_libraries":
       return await reasoningServer.listLibraries();
-    
+
     case "switch_memory_library":
       const { library_name: switchLibName } = args as { library_name: string };
       return await reasoningServer.switchLibrary(switchLibName);
-    
+
     case "get_current_library_info":
       return reasoningServer.getCurrentLibraryInfo();
-    
+
     case "create_system_json":
-      const { name: sysJsonName, domain, description, data, tags } = args as { 
-        name: string; 
-        domain: string; 
-        description: string; 
-        data: Record<string, unknown>; 
-        tags?: string[] 
+      const { name: sysJsonName, domain, description, data, tags } = args as {
+        name: string;
+        domain: string;
+        description: string;
+        data: Record<string, unknown>;
+        tags?: string[]
       };
       return await reasoningServer.createSystemJSON(sysJsonName, domain, description, data, tags);
-    
+
     case "get_system_json":
       const { name: getSysJsonName } = args as { name: string };
       return await reasoningServer.getSystemJSON(getSysJsonName);
-    
+
     case "search_system_json":
       const { query: searchQuery } = args as { query: string };
       return await reasoningServer.searchSystemJSON(searchQuery);
-    
+
     case "list_system_json":
       return await reasoningServer.listSystemJSON();
-    
+
     default:
       return {
         content: [{
